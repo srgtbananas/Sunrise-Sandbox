@@ -393,7 +393,7 @@ bool export_catalog_csv(std::size_t& written) noexcept {
         "mission_category,faction_inferred,placement_mode,destinations,destination_count,"
         "package_ids,package_count,client_bubble_count,activity_count,occurrences,"
         "v93_safe_anchor,normal_enemy_type,has_resolved_name,classification_confidence,"
-        "faction,combatant_rank,unit_type,variant,threat_level,enabled\\r\\n";
+        "faction,combatant_rank,unit_type,variant,threat_level,enabled\r\n";
     std::fputs(header, file);
     const auto write = [&](const Candidate& candidate) {
         char tag[16]{};
@@ -413,7 +413,7 @@ bool export_catalog_csv(std::size_t& written) noexcept {
         csv_field(file, candidate.package.data());
         std::fputs(",,,,,,,", file); // package_count through normal_enemy_type
         std::fputs(candidate.named ? "TRUE" : "FALSE", file);
-        std::fputs(",,,,,,,TRUE\\r\\n", file); // confidence through enabled
+        std::fputs(",,,,,,,TRUE\r\n", file); // confidence through enabled
         ++written;
     };
     for (const Candidate& candidate : g_allMainCandidates) write(candidate);
