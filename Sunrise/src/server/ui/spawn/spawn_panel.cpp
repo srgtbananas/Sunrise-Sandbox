@@ -131,6 +131,9 @@ std::vector<state::build_data::entity_names::Name> g_names{};
 bool g_scanned{};
 bool g_exportAttempted{};
 bool g_dropdownExportAttempted{};
+bool g_diagnosticsAttempted{};
+bool g_diagnosticsOk{};
+std::size_t g_diagnosticsCount{};
 bool g_dropdownExportOk{};
 std::size_t g_dropdownExportCount{};
 std::size_t g_exportNamedCount{};
@@ -473,6 +476,65 @@ bool export_visible_picker_csv(std::size_t& written) noexcept {
     return std::fclose(file) == 0;
 }
 
+// Diagnose name availability independently of the resident-only picker scan.
+// In particular, the reference tags below are visible in a user screenshot.
+bool export_name_source_diagnostics(std::size_t& written) noexcept {
+    written = 0;
+    FILE* file = nullptr;
+    if (fopen_s(&file, "sunrise_spawn_name_diagnostics.csv", "wb") != 0 || file == nullptr) {
+        return false;
+    }
+    std::fputs("source,tag,name,in_main,in_projectile,in_loot,package_directory\r\n", file);
+    core::path::Buffer directory{};
+    const bool directoryOk = client::content::items::packages::package_directory(directory);
+    const auto present = [](const Column& column, std::uint32_t tag) {
+        return std::any_of(column.candidates.begin(), column.candidates.end(),
+                           [tag](const Candidate& candidate) { return candidate.tag == tag; });
+    };
+    const auto write = [&](const char* source, std::uint32_t tag, const char* name) {
+        char tagText[16]{};
+        (void)std::snprintf(tagText, sizeof(tagText), "0X%08X", tag);
+        csv_field(file, source);
+        std::fputc(',', file);
+        csv_field(file, tagText);
+        std::fputc(',', file);
+        csv_field(file, name);
+        std::fputc(',', file);
+        std::fputs(present(g_main, tag) ? "TRUE" : "FALSE", file);
+        std::fputc(',', file);
+        std::fputs(present(g_projectile, tag) ? "TRUE" : "FALSE", file);
+        std::fputc(',', file);
+        std::fputs(present(g_loot, tag) ? "TRUE" : "FALSE", file);
+        std::fputc(',', file);
+        // The wide package path is deliberately not converted here; diagnostics
+        // should remain valid even if the path contains non-ASCII characters.
+        csv_field(file, directoryOk ? "AVAILABLE" : "UNAVAILABLE");
+        std::fputs("\r\n", file);
+        ++written;
+    };
+    // Read a fresh snapshot independently of g_names, without altering the picker.
+    std::vector<state::build_data::entity_names::Name> names(
+        state::build_data::entity_name_count());
+    std::size_t count = 0;
+    const bool snapshotOk = state::build_data::snapshot_entity_names(names, count);
+    if (snapshotOk) {
+        names.resize(count);
+        for (const auto& name : names) {
+            write("published_name", name.tag, name.text.data());
+        }
+    }
+    constexpr std::array<std::uint32_t, 5> screenshotTags{
+        0x80C0FA65U, 0x80C1A52DU, 0x80C19B1FU, 0x80C187BDU, 0x80BDEBBFU
+    };
+    for (const auto tag : screenshotTags) {
+        const auto it = std::find_if(names.begin(), names.end(),
+            [tag](const auto& name) { return name.tag == tag; });
+        write(snapshotOk ? "screenshot_probe" : "snapshot_unavailable",
+              tag, it != names.end() ? it->text.data() : "");
+    }
+    return std::fclose(file) == 0;
+}
+
 void refresh() noexcept {
     g_main.candidates.clear();
     g_projectile.candidates.clear();
@@ -796,6 +858,16 @@ void draw() noexcept {
         ImGui::TextDisabled(g_dropdownExportOk
             ? "Captured %zu displayed dropdown rows to sunrise_spawn_dropdown_values.csv"
             : "Dropdown export failed: check write permissions", g_dropdownExportCount);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Export Name Source Diagnostics")) {
+        g_diagnosticsOk = export_name_source_diagnostics(g_diagnosticsCount);
+        g_diagnosticsAttempted = true;
+    }
+    if (g_diagnosticsAttempted) {
+        ImGui::TextDisabled(g_diagnosticsOk
+            ? "Name diagnostics: %zu rows written to sunrise_spawn_name_diagnostics.csv"
+            : "Name diagnostics export failed", g_diagnosticsCount);
     }
     if (g_exportAttempted) {
         if (g_exportOk) {
