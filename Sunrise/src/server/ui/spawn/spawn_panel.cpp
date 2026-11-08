@@ -109,6 +109,7 @@ struct Candidate {
     std::uint32_t tag{};
     ObjectType type{};
     bool named{};
+    bool resident{true};
     std::array<char, 224> label{};
     std::array<char, 96> package{};
     std::array<char, 128> name{};
@@ -129,6 +130,8 @@ Column g_main{};
 Column g_projectile{};
 Column g_loot{};
 std::vector<Candidate> g_allMainCandidates{};
+std::vector<Candidate> g_residentMainCandidates{};
+bool g_showAllInstalledActors{};
 std::vector<state::build_data::entity_names::Name> g_names{};
 bool g_scanned{};
 bool g_exportAttempted{};
@@ -372,6 +375,29 @@ void configure_candidates(native::SelectionList list, const Column& column) noex
         list, {column.tags.data(), column.tags.size()}, column.selected);
 }
 
+void rebuild_main_source() {
+    g_allMainCandidates = g_residentMainCandidates;
+    if (!g_showAllInstalledActors) return;
+    // Published names are independent of location. Nonresident entries are
+    // browse-only: never send their tags to the native spawn candidate list.
+    for (const auto& entry : g_names) {
+        if (std::any_of(g_allMainCandidates.begin(), g_allMainCandidates.end(),
+                        [&](const Candidate& candidate) { return candidate.tag == entry.tag; }))
+            continue;
+        Candidate candidate{};
+        candidate.tag = entry.tag;
+        candidate.type = ObjectType::Invalid;
+        candidate.resident = false;
+        candidate.named = true;
+        (void)std::snprintf(candidate.name.data(), candidate.name.size(), "%s",
+                            entry.text.data());
+        (void)std::snprintf(candidate.label.data(), candidate.label.size(),
+                            "%s | Not loaded (browse only) | 0x%08X",
+                            entry.text.data(), entry.tag);
+        g_allMainCandidates.push_back(candidate);
+    }
+}
+
 void apply_main_type_filter(std::uint64_t hiddenTypes) {
     g_main.candidates.clear();
     g_main.candidates.reserve(g_allMainCandidates.size());
@@ -381,7 +407,12 @@ void apply_main_type_filter(std::uint64_t hiddenTypes) {
         }
     }
     finish_column(g_main);
-    configure_candidates(native::SelectionList::main, g_main);
+    // Preserve index alignment but use a sentinel for browse-only entries.
+    std::vector<std::uint32_t> safeTags = g_main.tags;
+    for (std::size_t i = 0; i < g_main.candidates.size(); ++i)
+        if (!g_main.candidates[i].resident) safeTags[i] = 0xFFFFFFFFU;
+    native::configure_candidates(native::SelectionList::main,
+                                 {safeTags.data(), safeTags.size()}, g_main.selected);
 }
 
 // Export the complete scanned catalog, not the visibility-filtered main picker.
@@ -633,6 +664,7 @@ void refresh() noexcept {
     g_projectile.candidates.clear();
     g_loot.candidates.clear();
     g_allMainCandidates.clear();
+    g_residentMainCandidates.clear();
     g_names.resize(state::build_data::entity_name_count());
     std::size_t nameCount = 0;
     if (!state::build_data::snapshot_entity_names(g_names, nameCount)) {
@@ -649,7 +681,8 @@ void refresh() noexcept {
         package_reader::release_caches();
     }
     finish_column(g_main);
-    g_allMainCandidates = g_main.candidates;
+    g_residentMainCandidates = g_main.candidates;
+    rebuild_main_source();
     apply_main_type_filter(spawn_keys::get().hiddenMainTypes);
     finish_column(g_projectile);
     finish_column(g_loot);
@@ -888,12 +921,23 @@ void draw_column(const char* title,
         if (showTypeFilter) {
             draw_main_type_filter(keybinds, keybindsChanged);
         }
+        if (showTypeFilter) {
+            if (ImGui::Checkbox("All named actors (including other locations)",
+                                &g_showAllInstalledActors)) {
+                rebuild_main_source();
+                apply_main_type_filter(keybinds.hiddenMainTypes);
+            }
+            if (g_showAllInstalledActors)
+                ImGui::TextDisabled("Not loaded = browse only; spawning disabled.");
+        }
         const std::span<const picker::Item> rows(column.items.data(), column.items.size());
         if (picker::control("picker", preview(column), rows, column.selected)) {
             native::select_candidate(selectionList, column.selected);
         }
 
-        ImGui::BeginDisabled(column.selected >= column.candidates.size() || native::busy());
+        ImGui::BeginDisabled(column.selected >= column.candidates.size() || native::busy()
+                         || (column.selected < column.candidates.size()
+                             && !column.candidates[column.selected].resident));
         if (ImGui::Button("At player", ImVec2(ImGui::GetContentRegionAvail().x * 0.49F, 0.0F))) {
             (void)native::request(column.candidates[column.selected].tag,
                                   native::Origin::player,
@@ -918,6 +962,7 @@ void draw_column(const char* title,
         ImGui::TreePop();
     }
     const std::uint32_t selectedTag = column.selected < column.candidates.size()
+                                          && column.candidates[column.selected].resident
                                           ? column.candidates[column.selected].tag
                                           : 0xFFFFFFFFU;
     const std::uint32_t amount = static_cast<std::uint32_t>((std::max)(column.amount, 1));
@@ -937,22 +982,6 @@ void draw() noexcept {
         refresh();
     }
     ImGui::SameLine();
-    if (ImGui::Button("Export Actor Catalog CSV")) {
-        refresh(); // Re-read published name snapshot before writing the export.
-        g_exportOk = export_catalog_csv(g_exportCount);
-        g_exportAttempted = true;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Export Current Dropdown Values")) {
-        g_dropdownExportOk = export_visible_picker_csv(g_dropdownExportCount);
-        g_dropdownExportAttempted = true;
-    }
-    if (g_dropdownExportAttempted) {
-        ImGui::TextDisabled(g_dropdownExportOk
-            ? "Captured %zu displayed dropdown rows to sunrise_spawn_dropdown_values.csv"
-            : "Dropdown export failed: check write permissions", g_dropdownExportCount);
-    }
-    ImGui::SameLine();
     if (ImGui::Button("Export Name Source Diagnostics")) {
         g_diagnosticsOk = export_name_source_diagnostics(g_diagnosticsCount);
         g_diagnosticsAttempted = true;
@@ -961,29 +990,6 @@ void draw() noexcept {
         ImGui::TextDisabled(g_diagnosticsOk
             ? "Name diagnostics: %zu rows written to sunrise_spawn_name_diagnostics.csv"
             : "Name diagnostics export failed", g_diagnosticsCount);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Export Named Catalog + Aliases")) {
-        g_namedCatalogOk = export_named_catalog_csv(g_namedCatalogCount);
-        g_namedCatalogAttempted = true;
-    }
-    if (g_namedCatalogAttempted) {
-        if (g_namedCatalogOk)
-            ImGui::TextDisabled("Named catalog: %zu unique tags to sunrise_spawn_named_catalog.csv",
-                                g_namedCatalogCount);
-        else
-            ImGui::TextDisabled("Named catalog export failed");
-    }
-    if (g_exportAttempted) {
-        if (g_exportOk) {
-            ImGui::TextDisabled("Exported %zu rows (%zu named, %zu name snapshot entries)",
-                                g_exportCount, g_exportNamedCount, g_exportSnapshotCount);
-            if (g_exportNamedCount == 0) {
-                ImGui::TextDisabled("WARNING: Name snapshot is empty; export lacks names.");
-            }
-        } else {
-            ImGui::TextDisabled("CSV export failed: check write permissions");
-        }
     }
     ImGui::SameLine();
     ImGui::TextDisabled("%zu main  |  %zu projectiles  |  %zu loot",
