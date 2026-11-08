@@ -7,6 +7,7 @@
 #include <cfloat>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <imgui.h>
 #include <span>
 #include <string_view>
@@ -107,6 +108,8 @@ struct Candidate {
     ObjectType type{};
     bool named{};
     std::array<char, 224> label{};
+    std::array<char, 96> package{};
+    std::array<char, 128> name{};
 };
 
 struct Column {
@@ -126,6 +129,9 @@ Column g_loot{};
 std::vector<Candidate> g_allMainCandidates{};
 std::vector<state::build_data::entity_names::Name> g_names{};
 bool g_scanned{};
+bool g_exportAttempted{};
+bool g_exportOk{};
+std::size_t g_exportCount{};
 std::size_t g_capturingKey{spawn_keys::kActionCount};
 
 void key_name(std::uint32_t virtualKey, std::array<char, 64>& output) noexcept {
@@ -267,6 +273,10 @@ void add_candidate(Column& column,
         typeName = unknownType.data();
     }
     value.named = name != nullptr;
+    value.package = package;
+    if (name != nullptr) {
+        (void)std::snprintf(value.name.data(), value.name.size(), "%s", name);
+    }
     if (name != nullptr) {
         (void)std::snprintf(value.label.data(),
                             value.label.size(),
@@ -359,6 +369,57 @@ void apply_main_type_filter(std::uint64_t hiddenTypes) {
     }
     finish_column(g_main);
     configure_candidates(native::SelectionList::main, g_main);
+}
+
+// Export the complete scanned catalog, not the visibility-filtered main picker.
+// This is a standalone snapshot; it does not modify any game packages or databases.
+void csv_field(FILE* file, const char* value) {
+    std::fputc('"', file);
+    for (const char* p = value; *p != '\\0'; ++p) {
+        if (*p == '"') std::fputc('"', file);
+        std::fputc(*p, file);
+    }
+    std::fputc('"', file);
+}
+
+bool export_catalog_csv(std::size_t& written) noexcept {
+    written = 0;
+    FILE* file = nullptr;
+    if (fopen_s(&file, "sunrise_spawn_catalog.csv", "wb") != 0 || file == nullptr) {
+        return false;
+    }
+    constexpr const char* header =
+        "tag,primary_name,aliases,alias_count,object_type,object_type_name,"
+        "mission_category,faction_inferred,placement_mode,destinations,destination_count,"
+        "package_ids,package_count,client_bubble_count,activity_count,occurrences,"
+        "v93_safe_anchor,normal_enemy_type,has_resolved_name,classification_confidence,"
+        "faction,combatant_rank,unit_type,variant,threat_level,enabled\\r\\n";
+    std::fputs(header, file);
+    const auto write = [&](const Candidate& candidate) {
+        char tag[16]{};
+        char type[16]{};
+        (void)std::snprintf(tag, sizeof(tag), "0X%08X", candidate.tag);
+        (void)std::snprintf(type, sizeof(type), "%u",
+                            static_cast<unsigned>(candidate.type));
+        csv_field(file, tag);
+        std::fputc(',', file);
+        csv_field(file, candidate.name.data());
+        std::fputs(",,,", file); // aliases, alias_count
+        csv_field(file, type);
+        std::fputc(',', file);
+        const char* typeName = object_type_name(candidate.type);
+        csv_field(file, typeName != nullptr ? typeName : "Unknown");
+        std::fputs(",,,,,", file); // mission_category through destination_count
+        csv_field(file, candidate.package.data());
+        std::fputs(",,,,,,,", file); // package_count through normal_enemy_type
+        std::fputs(candidate.named ? "TRUE" : "FALSE", file);
+        std::fputs(",,,,,,,TRUE\\r\\n", file); // confidence through enabled
+        ++written;
+    };
+    for (const Candidate& candidate : g_allMainCandidates) write(candidate);
+    for (const Candidate& candidate : g_projectile.candidates) write(candidate);
+    for (const Candidate& candidate : g_loot.candidates) write(candidate);
+    return std::fclose(file) == 0;
 }
 
 void refresh() noexcept {
@@ -668,6 +729,16 @@ void draw() noexcept {
 
     if (ImGui::Button("Refresh loaded entities")) {
         refresh();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Export Actor Catalog CSV")) {
+        g_exportOk = export_catalog_csv(g_exportCount);
+        g_exportAttempted = true;
+    }
+    if (g_exportAttempted) {
+        ImGui::TextDisabled(g_exportOk
+            ? "Exported %zu records to sunrise_spawn_catalog.csv (working directory)"
+            : "CSV export failed: check write permissions", g_exportCount);
     }
     ImGui::SameLine();
     ImGui::TextDisabled("%zu main  |  %zu projectiles  |  %zu loot",
