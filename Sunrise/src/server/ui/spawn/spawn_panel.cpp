@@ -520,7 +520,7 @@ bool export_name_source_diagnostics(std::size_t& written) noexcept {
     if (fopen_s(&file, "sunrise_spawn_name_diagnostics.csv", "wb") != 0 || file == nullptr) {
         return false;
     }
-    std::fputs("source,tag,name,in_main,in_projectile,in_loot,package_directory\r\n", file);
+    std::fputs("source,tag,name,in_main,in_projectile,in_loot,package_directory,object_type,object_type_name\r\n", file);
     core::path::Buffer directory{};
     const bool directoryOk = client::content::items::packages::package_directory(directory);
     const auto present = [](const Column& column, std::uint32_t tag) {
@@ -545,6 +545,20 @@ bool export_name_source_diagnostics(std::size_t& written) noexcept {
         // The wide package path is deliberately not converted here; diagnostics
         // should remain valid even if the path contains non-ASCII characters.
         csv_field(file, directoryOk ? "AVAILABLE" : "UNAVAILABLE");
+        // Match the dropdown's runtime type when the tag is resident.
+        // The published name table itself does not carry object types.
+        std::uint8_t type = 0;
+        const bool resolved = native::is_tag_resident(tag)
+                              && native::object_type(tag, type);
+        char typeCode[16]{};
+        if (resolved)
+            (void)std::snprintf(typeCode, sizeof(typeCode), "%u",
+                                static_cast<unsigned>(type));
+        std::fputc(',', file);
+        csv_field(file, typeCode);
+        std::fputc(',', file);
+        const char* typeName = resolved ? object_type_name(static_cast<ObjectType>(type)) : nullptr;
+        csv_field(file, typeName != nullptr ? typeName : "");
         std::fputs("\r\n", file);
         ++written;
     };
