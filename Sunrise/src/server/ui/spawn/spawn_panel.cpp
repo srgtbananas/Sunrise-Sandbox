@@ -7,8 +7,11 @@
 #include <cfloat>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <imgui.h>
 #include <span>
+#include <map>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -106,7 +109,10 @@ struct Candidate {
     std::uint32_t tag{};
     ObjectType type{};
     bool named{};
+    bool resident{true};
     std::array<char, 224> label{};
+    std::array<char, 96> package{};
+    std::array<char, 128> name{};
 };
 
 struct Column {
@@ -124,8 +130,24 @@ Column g_main{};
 Column g_projectile{};
 Column g_loot{};
 std::vector<Candidate> g_allMainCandidates{};
+std::vector<Candidate> g_residentMainCandidates{};
+bool g_showAllInstalledActors{};
 std::vector<state::build_data::entity_names::Name> g_names{};
 bool g_scanned{};
+bool g_exportAttempted{};
+bool g_dropdownExportAttempted{};
+bool g_namedCatalogAttempted{};
+bool g_namedCatalogOk{};
+std::size_t g_namedCatalogCount{};
+bool g_diagnosticsAttempted{};
+bool g_diagnosticsOk{};
+std::size_t g_diagnosticsCount{};
+bool g_dropdownExportOk{};
+std::size_t g_dropdownExportCount{};
+std::size_t g_exportNamedCount{};
+std::size_t g_exportSnapshotCount{};
+bool g_exportOk{};
+std::size_t g_exportCount{};
 std::size_t g_capturingKey{spawn_keys::kActionCount};
 
 void key_name(std::uint32_t virtualKey, std::array<char, 64>& output) noexcept {
@@ -267,6 +289,10 @@ void add_candidate(Column& column,
         typeName = unknownType.data();
     }
     value.named = name != nullptr;
+    value.package = package;
+    if (name != nullptr) {
+        (void)std::snprintf(value.name.data(), value.name.size(), "%s", name);
+    }
     if (name != nullptr) {
         (void)std::snprintf(value.label.data(),
                             value.label.size(),
@@ -349,6 +375,29 @@ void configure_candidates(native::SelectionList list, const Column& column) noex
         list, {column.tags.data(), column.tags.size()}, column.selected);
 }
 
+void rebuild_main_source() {
+    g_allMainCandidates = g_residentMainCandidates;
+    if (!g_showAllInstalledActors) return;
+    // Published names are independent of location. Nonresident entries are
+    // browse-only: never send their tags to the native spawn candidate list.
+    for (const auto& entry : g_names) {
+        if (std::any_of(g_allMainCandidates.begin(), g_allMainCandidates.end(),
+                        [&](const Candidate& candidate) { return candidate.tag == entry.tag; }))
+            continue;
+        Candidate candidate{};
+        candidate.tag = entry.tag;
+        candidate.type = ObjectType::Invalid;
+        candidate.resident = false;
+        candidate.named = true;
+        (void)std::snprintf(candidate.name.data(), candidate.name.size(), "%s",
+                            entry.text.data());
+        (void)std::snprintf(candidate.label.data(), candidate.label.size(),
+                            "%s | Not loaded (browse only) | 0x%08X",
+                            entry.text.data(), entry.tag);
+        g_allMainCandidates.push_back(candidate);
+    }
+}
+
 void apply_main_type_filter(std::uint64_t hiddenTypes) {
     g_main.candidates.clear();
     g_main.candidates.reserve(g_allMainCandidates.size());
@@ -358,7 +407,270 @@ void apply_main_type_filter(std::uint64_t hiddenTypes) {
         }
     }
     finish_column(g_main);
-    configure_candidates(native::SelectionList::main, g_main);
+    // Preserve index alignment but use a sentinel for browse-only entries.
+    std::vector<std::uint32_t> safeTags = g_main.tags;
+    for (std::size_t i = 0; i < g_main.candidates.size(); ++i)
+        if (!g_main.candidates[i].resident) safeTags[i] = 0xFFFFFFFFU;
+    native::configure_candidates(native::SelectionList::main,
+                                 {safeTags.data(), safeTags.size()}, g_main.selected);
+}
+
+// Export the complete scanned catalog, not the visibility-filtered main picker.
+// This is a standalone snapshot; it does not modify any game packages or databases.
+void csv_field(FILE* file, const char* value) {
+    std::fputc('"', file);
+    for (const char* p = value; *p != '\0'; ++p) {
+        if (*p == '"') std::fputc('"', file);
+        std::fputc(*p, file);
+    }
+    std::fputc('"', file);
+}
+
+bool export_catalog_csv(std::size_t& written) noexcept {
+    written = 0;
+    g_exportNamedCount = 0;
+    g_exportSnapshotCount = g_names.size();
+    FILE* file = nullptr;
+    if (fopen_s(&file, "sunrise_spawn_catalog.csv", "wb") != 0 || file == nullptr) {
+        return false;
+    }
+    constexpr const char* header =
+        "tag,primary_name,aliases,alias_count,object_type,object_type_name,"
+        "mission_category,faction_inferred,placement_mode,destinations,destination_count,"
+        "package_ids,package_count,client_bubble_count,activity_count,occurrences,"
+        "v93_safe_anchor,normal_enemy_type,has_resolved_name,classification_confidence,"
+        "faction,combatant_rank,unit_type,variant,threat_level,enabled\r\n";
+    std::fputs(header, file);
+    const auto write = [&](const Candidate& candidate) {
+        char tag[16]{};
+        char type[16]{};
+        (void)std::snprintf(tag, sizeof(tag), "0X%08X", candidate.tag);
+        (void)std::snprintf(type, sizeof(type), "%u",
+                            static_cast<unsigned>(candidate.type));
+        csv_field(file, tag);
+        std::fputc(',', file);
+        csv_field(file, candidate.name.data());
+        std::fputs(",,,", file); // aliases, alias_count
+        csv_field(file, type);
+        std::fputc(',', file);
+        const char* typeName = object_type_name(candidate.type);
+        csv_field(file, typeName != nullptr ? typeName : "Unknown");
+        std::fputs(",,,,,,", file); // mission_category through destination_count
+        csv_field(file, candidate.package.data());
+        std::fputs(",,,,,,,", file); // package_count through normal_enemy_type
+        std::fputs(candidate.named ? "TRUE" : "FALSE", file);
+        std::fputs(",,,,,,,TRUE\r\n", file); // confidence through enabled
+        ++written;
+        if (candidate.named) ++g_exportNamedCount;
+    };
+    for (const Candidate& candidate : g_allMainCandidates) write(candidate);
+    for (const Candidate& candidate : g_projectile.candidates) write(candidate);
+    for (const Candidate& candidate : g_loot.candidates) write(candidate);
+    return std::fclose(file) == 0;
+}
+
+// Snapshot exactly what the three picker controls currently display.
+// Do not refresh here: refreshing could change the list before capture.
+bool export_visible_picker_csv(std::size_t& written) noexcept {
+    written = 0;
+    FILE* file = nullptr;
+    if (fopen_s(&file, "sunrise_spawn_dropdown_values.csv", "wb") != 0 || file == nullptr) {
+        return false;
+    }
+    std::fputs("dropdown,index,tag,display_label,primary_name,object_type,package\r\n", file);
+    const auto emit = [&](const char* group, const Column& column) {
+        for (std::size_t index = 0; index < column.candidates.size(); ++index) {
+            const Candidate& candidate = column.candidates[index];
+            char position[24]{};
+            char tag[16]{};
+            char type[16]{};
+            (void)std::snprintf(position, sizeof(position), "%zu", index);
+            (void)std::snprintf(tag, sizeof(tag), "0X%08X", candidate.tag);
+            (void)std::snprintf(type, sizeof(type), "%u",
+                                static_cast<unsigned>(candidate.type));
+            csv_field(file, group);
+            std::fputc(',', file);
+            csv_field(file, position);
+            std::fputc(',', file);
+            csv_field(file, tag);
+            std::fputc(',', file);
+            // Same Candidate::label pointer that finish_column gives picker::control.
+            csv_field(file, candidate.label.data());
+            std::fputc(',', file);
+            csv_field(file, candidate.name.data());
+            std::fputc(',', file);
+            csv_field(file, type);
+            std::fputc(',', file);
+            csv_field(file, candidate.package.data());
+            std::fputs("\r\n", file);
+            ++written;
+        }
+    };
+    emit("main", g_main);
+    emit("projectile", g_projectile);
+    emit("loot", g_loot);
+    return std::fclose(file) == 0;
+}
+
+// Diagnose name availability independently of the resident-only picker scan.
+// In particular, the reference tags below are visible in a user screenshot.
+bool export_name_source_diagnostics(std::size_t& written) noexcept {
+    written = 0;
+    FILE* file = nullptr;
+    if (fopen_s(&file, "sunrise_spawn_name_diagnostics.csv", "wb") != 0 || file == nullptr) {
+        return false;
+    }
+    std::fputs("source,tag,name,in_main,in_projectile,in_loot,package_directory,object_type,object_type_name\r\n", file);
+    core::path::Buffer directory{};
+    const bool directoryOk = client::content::items::packages::package_directory(directory);
+    const auto present = [](const Column& column, std::uint32_t tag) {
+        return std::any_of(column.candidates.begin(), column.candidates.end(),
+                           [tag](const Candidate& candidate) { return candidate.tag == tag; });
+    };
+    const auto write = [&](const char* source, std::uint32_t tag, const char* name) {
+        char tagText[16]{};
+        (void)std::snprintf(tagText, sizeof(tagText), "0X%08X", tag);
+        csv_field(file, source);
+        std::fputc(',', file);
+        csv_field(file, tagText);
+        std::fputc(',', file);
+        csv_field(file, name);
+        std::fputc(',', file);
+        std::fputs(present(g_main, tag) ? "TRUE" : "FALSE", file);
+        std::fputc(',', file);
+        std::fputs(present(g_projectile, tag) ? "TRUE" : "FALSE", file);
+        std::fputc(',', file);
+        std::fputs(present(g_loot, tag) ? "TRUE" : "FALSE", file);
+        std::fputc(',', file);
+        // The wide package path is deliberately not converted here; diagnostics
+        // should remain valid even if the path contains non-ASCII characters.
+        csv_field(file, directoryOk ? "AVAILABLE" : "UNAVAILABLE");
+        // Match the dropdown's runtime type when the tag is resident.
+        // The published name table itself does not carry object types.
+        std::uint8_t type = 0;
+        const bool resolved = native::is_tag_resident(tag)
+                              && native::object_type(tag, type);
+        char typeCode[16]{};
+        if (resolved)
+            (void)std::snprintf(typeCode, sizeof(typeCode), "%u",
+                                static_cast<unsigned>(type));
+        std::fputc(',', file);
+        csv_field(file, typeCode);
+        std::fputc(',', file);
+        const char* typeName = resolved ? object_type_name(static_cast<ObjectType>(type)) : nullptr;
+        csv_field(file, typeName != nullptr ? typeName : "");
+        std::fputs("\r\n", file);
+        ++written;
+    };
+    // Read a fresh snapshot independently of g_names, without altering the picker.
+    std::vector<state::build_data::entity_names::Name> names(
+        state::build_data::entity_name_count());
+    std::size_t count = 0;
+    const bool snapshotOk = state::build_data::snapshot_entity_names(names, count);
+    if (snapshotOk) {
+        names.resize(count);
+        for (const auto& name : names) {
+            write("published_name", name.tag, name.text.data());
+        }
+    }
+    constexpr std::array<std::uint32_t, 5> screenshotTags{
+        0x80C0FA65U, 0x80C1A52DU, 0x80C19B1FU, 0x80C187BDU, 0x80BDEBBFU
+    };
+    for (const auto tag : screenshotTags) {
+        const auto it = std::find_if(names.begin(), names.end(),
+            [tag](const auto& name) { return name.tag == tag; });
+        write(snapshotOk ? "screenshot_probe" : "snapshot_unavailable",
+              tag, it != names.end() ? it->text.data() : "");
+    }
+    return std::fclose(file) == 0;
+}
+
+// Export the published name table independently of resident-only spawn candidates.
+// Keep all distinct aliases for each tag; also retain scanned unnamed tags.
+bool export_named_catalog_csv(std::size_t& written) noexcept {
+    written = 0;
+    std::vector<state::build_data::entity_names::Name> snapshot(
+        state::build_data::entity_name_count());
+    std::size_t count = 0;
+    if (!state::build_data::snapshot_entity_names(snapshot, count)) return false;
+    snapshot.resize(count);
+
+    struct Record {
+        std::vector<std::string> names{};
+        const Candidate* scanned{};
+        bool inMain{};
+        bool inProjectile{};
+        bool inLoot{};
+    };
+    std::map<std::uint32_t, Record> records;
+    for (const auto& entry : snapshot) {
+        // Bound the read to the fixed-size source buffer; do not assume termination.
+        const auto begin = entry.text.data();
+        const auto end = std::find(begin, begin + entry.text.size(), '\0');
+        std::string name(begin, end);
+        if (name.empty()) continue;
+        auto& names = records[entry.tag].names;
+        if (std::find(names.begin(), names.end(), name) == names.end())
+            names.push_back(std::move(name));
+    }
+    const auto add = [&](const Column& column, int group) {
+        for (const auto& candidate : column.candidates) {
+            auto& record = records[candidate.tag];
+            if (!record.scanned) record.scanned = &candidate;
+            if (group == 0) record.inMain = true;
+            if (group == 1) record.inProjectile = true;
+            if (group == 2) record.inLoot = true;
+        }
+    };
+    // The complete unfiltered main candidate list is essential here.
+    for (const auto& candidate : g_allMainCandidates) {
+        auto& record = records[candidate.tag];
+        if (!record.scanned) record.scanned = &candidate;
+        record.inMain = true;
+    }
+    add(g_projectile, 1);
+    add(g_loot, 2);
+
+    FILE* file = nullptr;
+    if (fopen_s(&file, "sunrise_spawn_named_catalog.csv", "wb") != 0 || !file)
+        return false;
+    std::fputs("tag,primary_name,aliases,alias_count,all_names,object_type,object_type_name,package,in_main,in_projectile,in_loot,in_spawn_scan,name_source\r\n", file);
+    for (const auto& [tag, record] : records) {
+        char hex[16]{}, countText[24]{}, typeText[16]{};
+        (void)std::snprintf(hex, sizeof(hex), "0X%08X", tag);
+        (void)std::snprintf(countText, sizeof(countText), "%zu",
+                            record.names.empty() ? 0 : record.names.size() - 1);
+        const Candidate* candidate = record.scanned;
+        if (candidate)
+            (void)std::snprintf(typeText, sizeof(typeText), "%u",
+                                static_cast<unsigned>(candidate->type));
+        std::string aliases, all;
+        for (std::size_t i = 0; i < record.names.size(); ++i) {
+            if (i) all += " | ";
+            all += record.names[i];
+            if (i > 1) aliases += " | ";
+            if (i) aliases += record.names[i];
+        }
+        csv_field(file, hex); std::fputc(',', file);
+        csv_field(file, record.names.empty() ? "" : record.names.front().c_str());
+        std::fputc(',', file); csv_field(file, aliases.c_str());
+        std::fputc(',', file); csv_field(file, countText);
+        std::fputc(',', file); csv_field(file, all.c_str());
+        std::fputc(',', file); csv_field(file, candidate ? typeText : "");
+        std::fputc(',', file);
+        csv_field(file, candidate ? object_type_name(candidate->type) : "");
+        std::fputc(',', file);
+        csv_field(file, candidate ? candidate->package.data() : "");
+        std::fputc(',', file); std::fputs(record.inMain ? "TRUE" : "FALSE", file);
+        std::fputc(',', file); std::fputs(record.inProjectile ? "TRUE" : "FALSE", file);
+        std::fputc(',', file); std::fputs(record.inLoot ? "TRUE" : "FALSE", file);
+        std::fputc(',', file); std::fputs(candidate ? "TRUE" : "FALSE", file);
+        std::fputc(',', file);
+        csv_field(file, record.names.empty() ? "spawn_scan_only" : "published_name_snapshot");
+        std::fputs("\r\n", file);
+        ++written;
+    }
+    return std::fclose(file) == 0;
 }
 
 void refresh() noexcept {
@@ -366,6 +678,7 @@ void refresh() noexcept {
     g_projectile.candidates.clear();
     g_loot.candidates.clear();
     g_allMainCandidates.clear();
+    g_residentMainCandidates.clear();
     g_names.resize(state::build_data::entity_name_count());
     std::size_t nameCount = 0;
     if (!state::build_data::snapshot_entity_names(g_names, nameCount)) {
@@ -382,7 +695,8 @@ void refresh() noexcept {
         package_reader::release_caches();
     }
     finish_column(g_main);
-    g_allMainCandidates = g_main.candidates;
+    g_residentMainCandidates = g_main.candidates;
+    rebuild_main_source();
     apply_main_type_filter(spawn_keys::get().hiddenMainTypes);
     finish_column(g_projectile);
     finish_column(g_loot);
@@ -621,12 +935,23 @@ void draw_column(const char* title,
         if (showTypeFilter) {
             draw_main_type_filter(keybinds, keybindsChanged);
         }
+        if (showTypeFilter) {
+            if (ImGui::Checkbox("All named actors (including other locations)",
+                                &g_showAllInstalledActors)) {
+                rebuild_main_source();
+                apply_main_type_filter(keybinds.hiddenMainTypes);
+            }
+            if (g_showAllInstalledActors)
+                ImGui::TextDisabled("Not loaded = browse only; spawning disabled.");
+        }
         const std::span<const picker::Item> rows(column.items.data(), column.items.size());
         if (picker::control("picker", preview(column), rows, column.selected)) {
             native::select_candidate(selectionList, column.selected);
         }
 
-        ImGui::BeginDisabled(column.selected >= column.candidates.size() || native::busy());
+        ImGui::BeginDisabled(column.selected >= column.candidates.size() || native::busy()
+                         || (column.selected < column.candidates.size()
+                             && !column.candidates[column.selected].resident));
         if (ImGui::Button("At player", ImVec2(ImGui::GetContentRegionAvail().x * 0.49F, 0.0F))) {
             (void)native::request(column.candidates[column.selected].tag,
                                   native::Origin::player,
@@ -651,6 +976,7 @@ void draw_column(const char* title,
         ImGui::TreePop();
     }
     const std::uint32_t selectedTag = column.selected < column.candidates.size()
+                                          && column.candidates[column.selected].resident
                                           ? column.candidates[column.selected].tag
                                           : 0xFFFFFFFFU;
     const std::uint32_t amount = static_cast<std::uint32_t>((std::max)(column.amount, 1));
@@ -668,6 +994,16 @@ void draw() noexcept {
 
     if (ImGui::Button("Refresh loaded entities")) {
         refresh();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Export Name Source Diagnostics")) {
+        g_diagnosticsOk = export_name_source_diagnostics(g_diagnosticsCount);
+        g_diagnosticsAttempted = true;
+    }
+    if (g_diagnosticsAttempted) {
+        ImGui::TextDisabled(g_diagnosticsOk
+            ? "Name diagnostics: %zu rows written to sunrise_spawn_name_diagnostics.csv"
+            : "Name diagnostics export failed", g_diagnosticsCount);
     }
     ImGui::SameLine();
     ImGui::TextDisabled("%zu main  |  %zu projectiles  |  %zu loot",
