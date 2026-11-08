@@ -130,6 +130,8 @@ std::vector<Candidate> g_allMainCandidates{};
 std::vector<state::build_data::entity_names::Name> g_names{};
 bool g_scanned{};
 bool g_exportAttempted{};
+std::size_t g_exportNamedCount{};
+std::size_t g_exportSnapshotCount{};
 bool g_exportOk{};
 std::size_t g_exportCount{};
 std::size_t g_capturingKey{spawn_keys::kActionCount};
@@ -384,6 +386,8 @@ void csv_field(FILE* file, const char* value) {
 
 bool export_catalog_csv(std::size_t& written) noexcept {
     written = 0;
+    g_exportNamedCount = 0;
+    g_exportSnapshotCount = g_names.size();
     FILE* file = nullptr;
     if (fopen_s(&file, "sunrise_spawn_catalog.csv", "wb") != 0 || file == nullptr) {
         return false;
@@ -415,6 +419,7 @@ bool export_catalog_csv(std::size_t& written) noexcept {
         std::fputs(candidate.named ? "TRUE" : "FALSE", file);
         std::fputs(",,,,,,,TRUE\r\n", file); // confidence through enabled
         ++written;
+        if (candidate.named) ++g_exportNamedCount;
     };
     for (const Candidate& candidate : g_allMainCandidates) write(candidate);
     for (const Candidate& candidate : g_projectile.candidates) write(candidate);
@@ -732,13 +737,20 @@ void draw() noexcept {
     }
     ImGui::SameLine();
     if (ImGui::Button("Export Actor Catalog CSV")) {
+        refresh(); // Re-read published name snapshot before writing the export.
         g_exportOk = export_catalog_csv(g_exportCount);
         g_exportAttempted = true;
     }
     if (g_exportAttempted) {
-        ImGui::TextDisabled(g_exportOk
-            ? "Exported %zu records to sunrise_spawn_catalog.csv (working directory)"
-            : "CSV export failed: check write permissions", g_exportCount);
+        if (g_exportOk) {
+            ImGui::TextDisabled("Exported %zu rows (%zu named, %zu name snapshot entries)",
+                                g_exportCount, g_exportNamedCount, g_exportSnapshotCount);
+            if (g_exportNamedCount == 0) {
+                ImGui::TextDisabled("WARNING: Name snapshot is empty; export lacks names.");
+            }
+        } else {
+            ImGui::TextDisabled("CSV export failed: check write permissions");
+        }
     }
     ImGui::SameLine();
     ImGui::TextDisabled("%zu main  |  %zu projectiles  |  %zu loot",
