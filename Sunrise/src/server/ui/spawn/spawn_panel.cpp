@@ -130,6 +130,9 @@ std::vector<Candidate> g_allMainCandidates{};
 std::vector<state::build_data::entity_names::Name> g_names{};
 bool g_scanned{};
 bool g_exportAttempted{};
+bool g_dropdownExportAttempted{};
+bool g_dropdownExportOk{};
+std::size_t g_dropdownExportCount{};
 std::size_t g_exportNamedCount{};
 std::size_t g_exportSnapshotCount{};
 bool g_exportOk{};
@@ -424,6 +427,49 @@ bool export_catalog_csv(std::size_t& written) noexcept {
     for (const Candidate& candidate : g_allMainCandidates) write(candidate);
     for (const Candidate& candidate : g_projectile.candidates) write(candidate);
     for (const Candidate& candidate : g_loot.candidates) write(candidate);
+    return std::fclose(file) == 0;
+}
+
+// Snapshot exactly what the three picker controls currently display.
+// Do not refresh here: refreshing could change the list before capture.
+bool export_visible_picker_csv(std::size_t& written) noexcept {
+    written = 0;
+    FILE* file = nullptr;
+    if (fopen_s(&file, "sunrise_spawn_dropdown_values.csv", "wb") != 0 || file == nullptr) {
+        return false;
+    }
+    std::fputs("dropdown,index,tag,display_label,primary_name,object_type,package\\r\\n", file);
+    const auto emit = [&](const char* group, const Column& column) {
+        for (std::size_t index = 0; index < column.candidates.size(); ++index) {
+            const Candidate& candidate = column.candidates[index];
+            char position[24]{};
+            char tag[16]{};
+            char type[16]{};
+            (void)std::snprintf(position, sizeof(position), "%zu", index);
+            (void)std::snprintf(tag, sizeof(tag), "0X%08X", candidate.tag);
+            (void)std::snprintf(type, sizeof(type), "%u",
+                                static_cast<unsigned>(candidate.type));
+            csv_field(file, group);
+            std::fputc(',', file);
+            csv_field(file, position);
+            std::fputc(',', file);
+            csv_field(file, tag);
+            std::fputc(',', file);
+            // Same Candidate::label pointer that finish_column gives picker::control.
+            csv_field(file, candidate.label.data());
+            std::fputc(',', file);
+            csv_field(file, candidate.name.data());
+            std::fputc(',', file);
+            csv_field(file, type);
+            std::fputc(',', file);
+            csv_field(file, candidate.package.data());
+            std::fputs("\\r\\n", file);
+            ++written;
+        }
+    };
+    emit("main", g_main);
+    emit("projectile", g_projectile);
+    emit("loot", g_loot);
     return std::fclose(file) == 0;
 }
 
@@ -740,6 +786,16 @@ void draw() noexcept {
         refresh(); // Re-read published name snapshot before writing the export.
         g_exportOk = export_catalog_csv(g_exportCount);
         g_exportAttempted = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Export Current Dropdown Values")) {
+        g_dropdownExportOk = export_visible_picker_csv(g_dropdownExportCount);
+        g_dropdownExportAttempted = true;
+    }
+    if (g_dropdownExportAttempted) {
+        ImGui::TextDisabled(g_dropdownExportOk
+            ? "Captured %zu displayed dropdown rows to sunrise_spawn_dropdown_values.csv"
+            : "Dropdown export failed: check write permissions", g_dropdownExportCount);
     }
     if (g_exportAttempted) {
         if (g_exportOk) {
