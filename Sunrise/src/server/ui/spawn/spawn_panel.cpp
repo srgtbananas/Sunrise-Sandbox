@@ -10,6 +10,8 @@
 #include <cstring>
 #include <imgui.h>
 #include <span>
+#include <map>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -131,6 +133,9 @@ std::vector<state::build_data::entity_names::Name> g_names{};
 bool g_scanned{};
 bool g_exportAttempted{};
 bool g_dropdownExportAttempted{};
+bool g_namedCatalogAttempted{};
+bool g_namedCatalogOk{};
+std::size_t g_namedCatalogCount{};
 bool g_diagnosticsAttempted{};
 bool g_diagnosticsOk{};
 std::size_t g_diagnosticsCount{};
@@ -535,6 +540,94 @@ bool export_name_source_diagnostics(std::size_t& written) noexcept {
     return std::fclose(file) == 0;
 }
 
+// Export the published name table independently of resident-only spawn candidates.
+// Keep all distinct aliases for each tag; also retain scanned unnamed tags.
+bool export_named_catalog_csv(std::size_t& written) noexcept {
+    written = 0;
+    std::vector<state::build_data::entity_names::Name> snapshot(
+        state::build_data::entity_name_count());
+    std::size_t count = 0;
+    if (!state::build_data::snapshot_entity_names(snapshot, count)) return false;
+    snapshot.resize(count);
+
+    struct Record {
+        std::vector<std::string> names{};
+        const Candidate* scanned{};
+        bool inMain{};
+        bool inProjectile{};
+        bool inLoot{};
+    };
+    std::map<std::uint32_t, Record> records;
+    for (const auto& entry : snapshot) {
+        // Bound the read to the fixed-size source buffer; do not assume termination.
+        const auto begin = entry.text.data();
+        const auto end = std::find(begin, begin + entry.text.size(), '\0');
+        std::string name(begin, end);
+        if (name.empty()) continue;
+        auto& names = records[entry.tag].names;
+        if (std::find(names.begin(), names.end(), name) == names.end())
+            names.push_back(std::move(name));
+    }
+    const auto add = [&](const Column& column, int group) {
+        for (const auto& candidate : column.candidates) {
+            auto& record = records[candidate.tag];
+            if (!record.scanned) record.scanned = &candidate;
+            if (group == 0) record.inMain = true;
+            if (group == 1) record.inProjectile = true;
+            if (group == 2) record.inLoot = true;
+        }
+    };
+    // The complete unfiltered main candidate list is essential here.
+    for (const auto& candidate : g_allMainCandidates) {
+        auto& record = records[candidate.tag];
+        if (!record.scanned) record.scanned = &candidate;
+        record.inMain = true;
+    }
+    add(g_projectile, 1);
+    add(g_loot, 2);
+
+    FILE* file = nullptr;
+    if (fopen_s(&file, "sunrise_spawn_named_catalog.csv", "wb") != 0 || !file)
+        return false;
+    std::fputs("tag,primary_name,aliases,alias_count,all_names,object_type,object_type_name,package,in_main,in_projectile,in_loot,in_spawn_scan,name_source\r\n", file);
+    for (const auto& [tag, record] : records) {
+        char hex[16]{}, countText[24]{}, typeText[16]{};
+        (void)std::snprintf(hex, sizeof(hex), "0X%08X", tag);
+        (void)std::snprintf(countText, sizeof(countText), "%zu",
+                            record.names.empty() ? 0 : record.names.size() - 1);
+        const Candidate* candidate = record.scanned;
+        if (candidate)
+            (void)std::snprintf(typeText, sizeof(typeText), "%u",
+                                static_cast<unsigned>(candidate->type));
+        std::string aliases, all;
+        for (std::size_t i = 0; i < record.names.size(); ++i) {
+            if (i) all += " | ";
+            all += record.names[i];
+            if (i > 1) aliases += " | ";
+            if (i) aliases += record.names[i];
+        }
+        csv_field(file, hex); std::fputc(',', file);
+        csv_field(file, record.names.empty() ? "" : record.names.front().c_str());
+        std::fputc(',', file); csv_field(file, aliases.c_str());
+        std::fputc(',', file); csv_field(file, countText);
+        std::fputc(',', file); csv_field(file, all.c_str());
+        std::fputc(',', file); csv_field(file, candidate ? typeText : "");
+        std::fputc(',', file);
+        csv_field(file, candidate ? object_type_name(candidate->type) : "");
+        std::fputc(',', file);
+        csv_field(file, candidate ? candidate->package.data() : "");
+        std::fputc(',', file); std::fputs(record.inMain ? "TRUE" : "FALSE", file);
+        std::fputc(',', file); std::fputs(record.inProjectile ? "TRUE" : "FALSE", file);
+        std::fputc(',', file); std::fputs(record.inLoot ? "TRUE" : "FALSE", file);
+        std::fputc(',', file); std::fputs(candidate ? "TRUE" : "FALSE", file);
+        std::fputc(',', file);
+        csv_field(file, record.names.empty() ? "spawn_scan_only" : "published_name_snapshot");
+        std::fputs("\r\n", file);
+        ++written;
+    }
+    return std::fclose(file) == 0;
+}
+
 void refresh() noexcept {
     g_main.candidates.clear();
     g_projectile.candidates.clear();
@@ -868,6 +961,18 @@ void draw() noexcept {
         ImGui::TextDisabled(g_diagnosticsOk
             ? "Name diagnostics: %zu rows written to sunrise_spawn_name_diagnostics.csv"
             : "Name diagnostics export failed", g_diagnosticsCount);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Export Named Catalog + Aliases")) {
+        g_namedCatalogOk = export_named_catalog_csv(g_namedCatalogCount);
+        g_namedCatalogAttempted = true;
+    }
+    if (g_namedCatalogAttempted) {
+        if (g_namedCatalogOk)
+            ImGui::TextDisabled("Named catalog: %zu unique tags to sunrise_spawn_named_catalog.csv",
+                                g_namedCatalogCount);
+        else
+            ImGui::TextDisabled("Named catalog export failed");
     }
     if (g_exportAttempted) {
         if (g_exportOk) {
