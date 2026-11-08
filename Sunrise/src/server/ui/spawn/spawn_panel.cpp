@@ -409,7 +409,7 @@ bool export_catalog_csv(std::size_t& written) noexcept {
         std::fputc(',', file);
         const char* typeName = object_type_name(candidate.type);
         csv_field(file, typeName != nullptr ? typeName : "Unknown");
-        std::fputs(",,,,,", file); // mission_category through destination_count
+        std::fputs(",,,,,,", file); // mission_category through destination_count
         csv_field(file, candidate.package.data());
         std::fputs(",,,,,,,", file); // package_count through normal_enemy_type
         std::fputs(candidate.named ? "TRUE" : "FALSE", file);
