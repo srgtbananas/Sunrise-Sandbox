@@ -375,7 +375,7 @@ void apply_main_type_filter(std::uint64_t hiddenTypes) {
 // This is a standalone snapshot; it does not modify any game packages or databases.
 void csv_field(FILE* file, const char* value) {
     std::fputc('"', file);
-    for (const char* p = value; *p != '\\0'; ++p) {
+    for (const char* p = value; *p != '\0'; ++p) {
         if (*p == '"') std::fputc('"', file);
         std::fputc(*p, file);
     }
