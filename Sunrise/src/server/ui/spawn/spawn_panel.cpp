@@ -438,7 +438,7 @@ bool export_visible_picker_csv(std::size_t& written) noexcept {
     if (fopen_s(&file, "sunrise_spawn_dropdown_values.csv", "wb") != 0 || file == nullptr) {
         return false;
     }
-    std::fputs("dropdown,index,tag,display_label,primary_name,object_type,package\\r\\n", file);
+    std::fputs("dropdown,index,tag,display_label,primary_name,object_type,package\r\n", file);
     const auto emit = [&](const char* group, const Column& column) {
         for (std::size_t index = 0; index < column.candidates.size(); ++index) {
             const Candidate& candidate = column.candidates[index];
@@ -463,7 +463,7 @@ bool export_visible_picker_csv(std::size_t& written) noexcept {
             csv_field(file, type);
             std::fputc(',', file);
             csv_field(file, candidate.package.data());
-            std::fputs("\\r\\n", file);
+            std::fputs("\r\n", file);
             ++written;
         }
     };
